@@ -1,0 +1,72 @@
+{
+	"name": "bun-serial",
+	"version": "0.8.0",
+	"description": "Cross-platform serial ports for Bun (Linux, macOS, Windows) via bun:ffi. No native compilation, no node-gyp.",
+	"keywords": [
+		"serial",
+		"serialport",
+		"uart",
+		"rs232",
+		"rs485",
+		"bun",
+		"ffi",
+		"termios",
+		"robotics",
+		"hardware"
+	],
+	"license": "MIT",
+	"author": "Kangmin Seon",
+	"homepage": "https://github.com/aka-bassman/bun-serial#readme",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/aka-bassman/bun-serial.git"
+	},
+	"bugs": {
+		"url": "https://github.com/aka-bassman/bun-serial/issues"
+	},
+	"type": "module",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"default": "./dist/index.js"
+		},
+		"./parsers": {
+			"types": "./dist/parsers/index.d.ts",
+			"default": "./dist/parsers/index.js"
+		},
+		"./mock": {
+			"types": "./dist/bindings/mock/index.d.ts",
+			"default": "./dist/bindings/mock/index.js"
+		}
+	},
+	"files": [
+		"dist",
+		"src",
+		"README.md",
+		"CHANGELOG.md",
+		"LICENSE"
+	],
+	"os": [
+		"darwin",
+		"linux",
+		"win32"
+	],
+	"engines": {
+		"bun": ">=1.4.0"
+	},
+	"scripts": {
+		"test": "bun test",
+		"typecheck": "tsc --noEmit",
+		"build": "bun -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.build.json",
+		"typecheck:consumer": "tsc -p tests/types",
+		"prepublishOnly": "bun run typecheck && bun test && bun run build && bun run typecheck:consumer",
+		"changeset": "changeset",
+		"version-packages": "changeset version",
+		"publish:npm": "bun scripts/release.ts"
+	},
+	"devDependencies": {
+		"@changesets/cli": "^3.0.3",
+		"@types/bun": "^1.4.2",
+		"typescript": "^7.0.2"
+	}
+}
