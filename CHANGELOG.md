@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.0
+
+### Minor Changes
+
+- Add `MockDevice.reconnect()` to plug a disconnected mock device back in, so replug scenarios can be tested on one `MockBinding`. A port left open across the unplug stays `DISCONNECTED` and doesn't keep the device busy.
+- Add `maxQueuedWrites`: past it, `write()` rejects with the new `QUEUE_FULL` code at once instead of queueing behind output the device isn't taking. `queuedWrites` reports how many writes are pending.
+  
+  Add `onListenerError(error, event)` to receive exceptions thrown by event listeners, including those of piped parsers, instead of having them rethrown as uncaught exceptions. A throwing listener no longer keeps the port's other listeners from running, and a parser now delivers every message of a chunk before rethrowing what its listeners threw (an `AggregateError` if several did).
+
 ## 0.8.0
 
 First release: a TypeScript rewrite of [bun-serialport](https://github.com/fredrikpaulin/bun-serialport)

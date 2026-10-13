@@ -1,6 +1,6 @@
 {
 	"name": "bun-serial",
-	"version": "0.8.0",
+	"version": "0.9.0",
 	"description": "Cross-platform serial ports for Bun (Linux, macOS, Windows) via bun:ffi. No native compilation, no node-gyp.",
 	"keywords": [
 		"serial",
