@@ -2,6 +2,7 @@
 
 import { EventEmitter } from 'node:events'
 import { SerialPortError } from '../errors.js'
+import { emitEach, throwErrors } from '../internal/emit.js'
 import type { Parser, ParserEvents } from './types.js'
 
 export interface ByteLengthParserOptions {
@@ -38,8 +39,11 @@ export class ByteLengthParser extends EventEmitter<ParserEvents<Uint8Array>> imp
     this.#buffer.copyWithin(0, consumed, this.#length)
     this.#length -= consumed
 
-    // Emit only once the buffer is consistent, so a throwing listener can't corrupt it.
-    for (const piece of chunks) this.emit('data', piece)
+    // Emit only once the buffer is consistent, so a throwing listener can't
+    // corrupt it, and deliver every chunk before rethrowing what listeners threw.
+    const errors: unknown[] = []
+    for (const piece of chunks) errors.push(...emitEach(this, 'data', [piece]))
+    throwErrors(errors)
   }
 
   /** Drop any buffered partial chunk. */

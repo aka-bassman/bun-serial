@@ -4,6 +4,7 @@
 
 import { invalidArgument, SerialPortError } from './errors.js'
 import type { Binding, BindingCapabilities } from './bindings/types.js'
+import type { SerialPortEvents } from './serial-port.js'
 
 export type DataBits = 5 | 6 | 7 | 8
 export type StopBits = 1 | 1.5 | 2
@@ -66,6 +67,19 @@ export interface SerialPortOptions extends OpenOptions {
   readBufferSize?: number
   /** Use this binding instead of the platform default — e.g. MockBinding in tests. */
   binding?: Binding
+  /**
+   * Most write() calls pending at once — queued or in progress. Past it,
+   * write() rejects QUEUE_FULL at once instead of queueing behind output the
+   * device isn't taking, where each would wait out writeTimeout in turn.
+   * @default Infinity
+   */
+  maxQueuedWrites?: number
+  /**
+   * Receives exceptions thrown by event listeners — including those of piped
+   * parsers. Without it, each is rethrown as an uncaught exception. Either
+   * way the other listeners still run and the port keeps reading.
+   */
+  onListenerError?: (error: unknown, event: keyof SerialPortEvents) => void
 }
 
 export type ResolvedOpenOptions = Readonly<Required<OpenOptions>>

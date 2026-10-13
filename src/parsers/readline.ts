@@ -2,6 +2,7 @@
 
 import { EventEmitter } from 'node:events'
 import { invalidArgument } from '../errors.js'
+import { emitEach, throwErrors } from '../internal/emit.js'
 import { DelimiterParser } from './delimiter.js'
 import type { Parser, ParserEvents } from './types.js'
 
@@ -23,7 +24,7 @@ export class ReadlineParser extends EventEmitter<ParserEvents<string>> implement
     if (typeof delimiter !== 'string') throw invalidArgument('delimiter', delimiter)
     const decoder = createDecoder(options.encoding ?? 'utf-8')
     this.#lines = new DelimiterParser({ delimiter })
-    this.#lines.on('data', (bytes) => this.emit('data', decoder.decode(bytes)))
+    this.#lines.on('data', (bytes) => throwErrors(emitEach(this, 'data', [decoder.decode(bytes)])))
   }
 
   push(chunk: Uint8Array): void {

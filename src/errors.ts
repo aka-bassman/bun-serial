@@ -13,6 +13,7 @@ export type SerialErrorCode =
   | 'DISCONNECTED' // device went away while open
   | 'CANCELED' // interrupted by close() or an AbortSignal
   | 'TIMEOUT' // a write stalled for longer than writeTimeout
+  | 'QUEUE_FULL' // write() with maxQueuedWrites already pending
   | 'IO' // any other OS failure — see osCode/syscall
 
 export interface SerialPortErrorOptions {

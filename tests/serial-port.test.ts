@@ -4,14 +4,15 @@
 import { describe, expect, test } from 'bun:test'
 import { MockBinding } from '../src/bindings/mock/index.js'
 import { isSerialPortError, type SerialPortError } from '../src/errors.js'
-import { readlineParser } from '../src/parsers/index.js'
-import { SerialPort } from '../src/serial-port.js'
+import { resolveOpenOptions, type SerialPortOptions } from '../src/options.js'
+import { delimiterParser, readlineParser } from '../src/parsers/index.js'
+import { SerialPort, type SerialPortEvents } from '../src/serial-port.js'
 import { errorCode, rejectionCode } from './helpers/errors.js'
 
 const decoder = new TextDecoder()
 const PATH = '/dev/mock0'
 
-function setup(options: { autoOpen?: boolean; writeTimeout?: number } = {}) {
+function setup(options: Partial<SerialPortOptions> = {}) {
   const binding = new MockBinding()
   const device = binding.addPort(PATH)
   const port = new SerialPort({ path: PATH, baudRate: 9600, autoOpen: false, binding, ...options })
@@ -40,6 +41,11 @@ describe('construction', () => {
     expect(errorCode(make({ autoOpen: 'yes' }))).toBe('INVALID_ARGUMENT')
     expect(errorCode(make({ hupcl: 'no' }))).toBe('INVALID_ARGUMENT')
     expect(errorCode(make({ binding: {} }))).toBe('INVALID_ARGUMENT')
+    expect(errorCode(make({ maxQueuedWrites: 0 }))).toBe('INVALID_ARGUMENT')
+    expect(errorCode(make({ maxQueuedWrites: 1.5 }))).toBe('INVALID_ARGUMENT')
+    expect(errorCode(make({ maxQueuedWrites: '8' }))).toBe('INVALID_ARGUMENT')
+    expect(errorCode(make({ onListenerError: 'log' }))).toBe('INVALID_ARGUMENT')
+    expect(errorCode(make({ autoOpen: false, maxQueuedWrites: Infinity, onListenerError: () => {} }))).toBeUndefined()
   })
 
   test('exposes path and baudRate, and starts closed', () => {
@@ -130,12 +136,18 @@ describe('data', () => {
     await port.close()
   })
 
-  test('a throwing data listener surfaces as an uncaught exception, not a disconnect', async () => {
+  test('without onListenerError, listener exceptions surface as uncaught exceptions, not a disconnect', async () => {
     // bun:test fails whichever test an uncaught exception lands in, so this runs in a child process.
     const child = Bun.spawn([process.execPath, `${import.meta.dir}/fixtures/throwing-listener.ts`], { stdout: 'pipe' })
     const output = await new Response(child.stdout).text()
     expect(await child.exited).toBe(0)
-    expect(JSON.parse(output)).toEqual({ uncaught: ['listener failed'], calls: 2, open: true })
+    expect(JSON.parse(output)).toEqual({
+      uncaught: ['listener failed', 'handler failed: open listener failed', 'No such port: /dev/missing'],
+      calls: 2,
+      seen: 2,
+      open: true,
+      opened: true,
+    })
   })
 
   test('pipe() feeds a parser until unpipe()', async () => {
@@ -155,6 +167,74 @@ describe('data', () => {
     await Bun.sleep(5)
     expect(lines).toEqual(['one', 'two'])
     await port.close()
+  })
+})
+
+describe('onListenerError', () => {
+  function recording() {
+    const failures: { message: string; event: keyof SerialPortEvents }[] = []
+    const onListenerError = (error: unknown, event: keyof SerialPortEvents) => {
+      failures.push({ message: (error as Error).message, event })
+    }
+    return { failures, onListenerError }
+  }
+
+  test('receives what a listener threw; the other listeners still run and reading goes on', async () => {
+    const { failures, onListenerError } = recording()
+    const { port, device } = await opened({ onListenerError })
+    const chunks: string[] = []
+    port.on('data', (chunk) => {
+      throw new Error(`failed on ${decoder.decode(chunk)}`)
+    })
+    port.on('data', (chunk) => chunks.push(decoder.decode(chunk)))
+
+    device.emit('a')
+    await Bun.sleep(5)
+    device.emit('b')
+    await Bun.sleep(5)
+    expect(chunks).toEqual(['a', 'b'])
+    expect(failures).toEqual([
+      { message: 'failed on a', event: 'data' },
+      { message: 'failed on b', event: 'data' },
+    ])
+    expect(port.isOpen).toBe(true)
+    await port.close()
+  })
+
+  test("receives what a piped parser's listener threw, and the parser loses no message", async () => {
+    const { failures, onListenerError } = recording()
+    const { port, device } = await opened({ onListenerError })
+    const frames: number[][] = []
+    const parser = port.pipe(delimiterParser({ delimiter: [0x55, 0xaa] }))
+    parser.on('data', (frame) => {
+      if (frame[0] === 1) throw new Error('bad frame')
+    })
+    parser.on('data', (frame) => frames.push([...frame]))
+
+    device.emit(Uint8Array.of(1, 0x55, 0xaa, 2, 0x55, 0xaa, 3, 0x55, 0xaa))
+    await Bun.sleep(5)
+    expect(frames).toEqual([[1], [2], [3]])
+    expect(failures).toEqual([{ message: 'bad frame', event: 'data' }])
+    await port.close()
+  })
+
+  test('covers open, close and error listeners too', async () => {
+    const { failures, onListenerError } = recording()
+    const { port, device } = setup({ onListenerError })
+    for (const event of ['open', 'close', 'error'] as const) {
+      port.on(event, () => {
+        throw new Error(`${event} listener failed`)
+      })
+    }
+    await port.open()
+    const closed = new Promise((resolve) => port.once('close', resolve))
+    device.disconnect()
+    await closed
+    expect(failures).toEqual([
+      { message: 'open listener failed', event: 'open' },
+      { message: 'error listener failed', event: 'error' },
+      { message: 'close listener failed', event: 'close' },
+    ])
   })
 })
 
@@ -201,6 +281,58 @@ describe('write', () => {
     device.setStalled(true)
     expect(await rejectionCode(port.write('x'))).toBe('TIMEOUT')
     device.setStalled(false)
+    await port.close()
+  })
+
+  test('maxQueuedWrites: past it, write() rejects QUEUE_FULL at once', async () => {
+    const { port, device } = await opened({ maxQueuedWrites: 2 })
+    device.setStalled(true)
+    const first = port.write('a')
+    const second = port.write('b')
+    expect(port.queuedWrites).toBe(2)
+    expect(await rejectionCode(port.write('c'))).toBe('QUEUE_FULL')
+    expect(port.queuedWrites).toBe(2)
+
+    device.setStalled(false)
+    await Promise.all([first, second])
+    expect(port.queuedWrites).toBe(0)
+    await port.write('d')
+    expect(decoder.decode(device.takeWritten())).toBe('abd')
+    await port.close()
+  })
+
+  test('a write that times out frees its place in the queue', async () => {
+    const { port, device } = await opened({ maxQueuedWrites: 1, writeTimeout: 20 })
+    device.setStalled(true)
+    expect(await rejectionCode(port.write('a'))).toBe('TIMEOUT')
+    expect(port.queuedWrites).toBe(0)
+    device.setStalled(false)
+    await port.write('b')
+    expect(decoder.decode(device.takeWritten())).toBe('b')
+    await port.close()
+  })
+
+  test('maxQueuedWrites counts writes only, and a closed port still reports NOT_OPEN', async () => {
+    const { port, device } = await opened({ maxQueuedWrites: 1 })
+    device.setStalled(true)
+    const drain = rejectionCode(port.drain())
+    const write = rejectionCode(port.write('a'))
+    expect(port.queuedWrites).toBe(1)
+    const closing = port.close()
+    expect(await rejectionCode(port.write('b'))).toBe('NOT_OPEN')
+    await closing
+    expect([await drain, await write]).toEqual(['CANCELED', 'CANCELED'])
+    expect(port.queuedWrites).toBe(0)
+  })
+
+  test('the queue is unbounded by default', async () => {
+    const { port, device } = await opened()
+    device.setStalled(true)
+    const writes = Array.from({ length: 1000 }, () => port.write('x'))
+    expect(port.queuedWrites).toBe(1000)
+    device.setStalled(false)
+    await Promise.all(writes)
+    expect(device.takeWritten().length).toBe(1000)
     await port.close()
   })
 
@@ -318,6 +450,43 @@ describe('disconnect', () => {
     const seen = new Promise<boolean>((resolve) => port.once('error', () => resolve(port.isOpen)))
     device.disconnect()
     expect(await seen).toBe(false)
+  })
+
+  test('after reconnect() the port can be reopened', async () => {
+    const { binding, port, device } = await opened()
+    const closed = new Promise((resolve) => port.once('close', resolve))
+    port.once('error', () => {})
+    device.disconnect()
+    await closed
+    expect(await binding.list()).toEqual([])
+    expect(await rejectionCode(port.open())).toBe('NOT_FOUND')
+
+    device.reconnect()
+    expect((await binding.list()).map((info) => info.path)).toEqual([PATH])
+    await port.open()
+    const chunk = new Promise<Uint8Array>((resolve) => port.once('data', resolve))
+    device.emit('back')
+    expect(decoder.decode(await chunk)).toBe('back')
+    await port.write('hi')
+    expect(decoder.decode(device.takeWritten())).toBe('hi')
+    await port.close()
+  })
+
+  test('a mock port left open across a replug stays disconnected and does not hold the device', async () => {
+    const binding = new MockBinding()
+    const device = binding.addPort(PATH)
+    const options = { baudRate: 9600 } as const
+    const stale = await binding.open(PATH, resolveOpenOptions(options, binding.capabilities))
+    device.disconnect()
+    device.reconnect()
+    expect(await rejectionCode(stale.write(Uint8Array.of(1)))).toBe('DISCONNECTED')
+
+    const fresh = await binding.open(PATH, resolveOpenOptions(options, binding.capabilities))
+    await stale.close()
+    await fresh.write(Uint8Array.of(2))
+    expect([...device.takeWritten()]).toEqual([2])
+    expect(await rejectionCode(binding.open(PATH, resolveOpenOptions(options, binding.capabilities)))).toBe('BUSY')
+    await fresh.close()
   })
 })
 

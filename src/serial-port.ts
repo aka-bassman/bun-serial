@@ -2,7 +2,7 @@
 // reopen), the read loop that turns BindingPort.read() into 'data' events,
 // and the output chain that keeps write(), drain() and update() in order.
 
-import { EventEmitter } from 'node:events'
+import { EventEmitter, errorMonitor } from 'node:events'
 import { defaultBinding } from './bindings/index.js'
 import type { Binding, BindingPort, ModemLines, ModemStatus, UpdateOptions } from './bindings/types.js'
 import {
@@ -13,6 +13,7 @@ import {
   toSerialPortError,
 } from './errors.js'
 import { snapshotBytes, type WriteData } from './internal/bytes.js'
+import { emitEach } from './internal/emit.js'
 import {
   resolveOpenOptions,
   validateBaudRate,
@@ -49,8 +50,12 @@ export class SerialPort extends EventEmitter<SerialPortEvents> {
   readonly #binding: Binding
   #options: ResolvedOpenOptions
   readonly #readBuffer: Uint8Array
+  readonly #maxQueuedWrites: number
+  readonly #onListenerError: SerialPortOptions['onListenerError']
   readonly #pipes = new Map<Parser, (chunk: Uint8Array) => void>()
   #session: Session | null = null
+  /** write() calls not yet settled. */
+  #queuedWrites = 0
   /**
    * Tail of the output chain: write(), drain() and update() run one at a
    * time, in call order. Calls join it synchronously, before any await, so a
@@ -64,11 +69,23 @@ export class SerialPort extends EventEmitter<SerialPortEvents> {
   constructor(options: SerialPortOptions) {
     super()
     if (typeof options !== 'object' || options === null) throw invalidArgument('options', options)
-    const { path, autoOpen = true, readBufferSize = DEFAULT_READ_BUFFER_SIZE } = options
+    const {
+      path,
+      autoOpen = true,
+      readBufferSize = DEFAULT_READ_BUFFER_SIZE,
+      maxQueuedWrites = Infinity,
+      onListenerError,
+    } = options
     if (typeof path !== 'string' || path === '') throw invalidArgument('path', path)
     if (typeof autoOpen !== 'boolean') throw invalidArgument('autoOpen', autoOpen)
     if (!Number.isInteger(readBufferSize) || readBufferSize < 1) {
       throw invalidArgument('readBufferSize', readBufferSize)
+    }
+    if (maxQueuedWrites !== Infinity && !(Number.isInteger(maxQueuedWrites) && maxQueuedWrites >= 1)) {
+      throw invalidArgument('maxQueuedWrites', maxQueuedWrites)
+    }
+    if (onListenerError !== undefined && typeof onListenerError !== 'function') {
+      throw invalidArgument('onListenerError', onListenerError)
     }
     const binding = options.binding ?? defaultBinding()
     if (!isBinding(binding)) throw invalidArgument('binding', binding)
@@ -77,6 +94,8 @@ export class SerialPort extends EventEmitter<SerialPortEvents> {
     this.#binding = binding
     this.#options = resolveOpenOptions(options, binding.capabilities)
     this.#readBuffer = new Uint8Array(readBufferSize)
+    this.#maxQueuedWrites = maxQueuedWrites
+    this.#onListenerError = onListenerError
 
     if (autoOpen) {
       // Start on the next microtask so the caller can attach listeners first,
@@ -102,6 +121,11 @@ export class SerialPort extends EventEmitter<SerialPortEvents> {
   /** True while open and not closing. */
   get isOpen(): boolean {
     return this.#session !== null && this.#closing === null
+  }
+
+  /** write() calls not yet settled — queued behind other output or in progress. */
+  get queuedWrites(): number {
+    return this.#queuedWrites
   }
 
   /** Open the port (only needed with autoOpen: false). Resolves once it's ready for I/O. */
@@ -134,9 +158,22 @@ export class SerialPort extends EventEmitter<SerialPortEvents> {
     } catch (err) {
       return Promise.reject(err)
     }
-    return this.#enqueue(async (session) => {
+    if (!this.#acceptsOutput()) return Promise.reject(notOpenError(this.#path))
+    if (this.#queuedWrites >= this.#maxQueuedWrites) {
+      return Promise.reject(
+        new SerialPortError('QUEUE_FULL', `${this.#queuedWrites} writes already pending on ${this.#path}`),
+      )
+    }
+    this.#queuedWrites++
+    const job = this.#enqueue(async (session) => {
       if (bytes.length > 0) await session.port.write(bytes, session.closing.signal)
     })
+    // Registered before the caller can await job, so the count is current when it resumes.
+    const settled = () => {
+      this.#queuedWrites--
+    }
+    job.then(settled, settled)
+    return job
   }
 
   /** Resolves once everything written so far has been transmitted. */
@@ -296,10 +333,8 @@ export class SerialPort extends EventEmitter<SerialPortEvents> {
   // open is in progress runs once it finishes; otherwise the port must be open
   // and not closing.
   #enqueue<T>(operation: (session: Session) => Promise<T>): Promise<T> {
+    if (!this.#acceptsOutput()) return Promise.reject(notOpenError(this.#path))
     const opening = this.#opening
-    if (!opening && (this.#session === null || this.#closing !== null)) {
-      return Promise.reject(notOpenError(this.#path))
-    }
     let ranOn: Session | null = null
     const job = this.#output.then(async () => {
       if (opening) await opening.catch(noop)
@@ -315,19 +350,47 @@ export class SerialPort extends EventEmitter<SerialPortEvents> {
     return job
   }
 
+  // Output may join the chain while an open is in progress, or while open and not closing.
+  #acceptsOutput(): boolean {
+    return this.#opening !== null || (this.#session !== null && this.#closing === null)
+  }
+
   // Listener exceptions must not unwind into the read loop or the close
-  // sequence. Rethrow them on their own microtask so they surface as uncaught
-  // exceptions, like any other event handler error — including an 'error'
-  // event nobody listens to.
+  // sequence, nor keep the remaining listeners from running. Each goes to
+  // onListenerError, or — without one, or if that throws too — is rethrown on
+  // its own microtask so it surfaces as an uncaught exception, like any other
+  // event handler error. An 'error' event nobody listens to is rethrown the
+  // same way, never handed to onListenerError: no listener failed, and the
+  // error must not pass unnoticed.
   #emitSafely<K extends keyof SerialPortEvents>(event: K, ...args: SerialPortEvents[K]): void {
+    if (event === 'error') {
+      for (const err of emitEach(this, errorMonitor, args)) this.#listenerFailed(err, event)
+      if (this.listenerCount('error') === 0) {
+        rethrow(args[0])
+        return
+      }
+    }
+    for (const err of emitEach(this, event, args)) this.#listenerFailed(err, event)
+  }
+
+  #listenerFailed(error: unknown, event: keyof SerialPortEvents): void {
+    const handler = this.#onListenerError
+    if (!handler) {
+      rethrow(error)
+      return
+    }
     try {
-      this.emit(event, ...(args as never))
+      handler(error, event)
     } catch (err) {
-      queueMicrotask(() => {
-        throw err
-      })
+      rethrow(err)
     }
   }
+}
+
+function rethrow(error: unknown): void {
+  queueMicrotask(() => {
+    throw error
+  })
 }
 
 function isBinding(value: unknown): value is Binding {

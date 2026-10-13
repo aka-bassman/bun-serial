@@ -50,8 +50,19 @@ async function main(): Promise<void> {
 
   const binding = new MockBinding()
   const device = binding.addPort('/dev/mock0', { vendorId: '0403' })
-  await using mock = new SerialPort({ path: '/dev/mock0', baudRate: 9600, binding })
+  await using mock = new SerialPort({
+    path: '/dev/mock0',
+    baudRate: 9600,
+    binding,
+    maxQueuedWrites: 256,
+    onListenerError: (error: unknown, event: 'open' | 'data' | 'error' | 'close') => console.error(event, error),
+  })
+  mock.queuedWrites satisfies number
+  const full = await mock.write('x').catch((err: unknown) => err)
+  if (isSerialPortError(full, 'QUEUE_FULL')) full.code satisfies SerialErrorCode
   device.emit('ok')
+  device.disconnect()
+  device.reconnect()
   await mock.write(device.takeWritten())
 }
 

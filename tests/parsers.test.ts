@@ -71,6 +71,31 @@ describe('delimiterParser', () => {
     expect(messages.map(decode)).toEqual(['b'])
   })
 
+  test('a throwing listener costs no message and no other listener, then push() rethrows', () => {
+    const parser = delimiterParser()
+    parser.on('data', (message) => {
+      if (decode(message) === 'a') throw new Error('listener failed')
+    })
+    const messages = collect(parser)
+    expect(() => parser.push(encode('a\nb\nc\n'))).toThrow('listener failed')
+    expect(messages.map(decode)).toEqual(['a', 'b', 'c'])
+  })
+
+  test('several throwing listeners are rethrown together as an AggregateError', () => {
+    const parser = delimiterParser()
+    parser.on('data', (message) => {
+      throw new Error(`failed on ${decode(message)}`)
+    })
+    let thrown: unknown
+    try {
+      parser.push(encode('a\nb\n'))
+    } catch (err) {
+      thrown = err
+    }
+    expect(thrown).toBeInstanceOf(AggregateError)
+    expect((thrown as AggregateError).errors.map((err: Error) => err.message)).toEqual(['failed on a', 'failed on b'])
+  })
+
   test('reset() drops a buffered partial message', () => {
     const parser = delimiterParser()
     const messages = collect(parser)
@@ -113,6 +138,16 @@ describe('byteLengthParser', () => {
     expect(chunks.map((c) => [...c])).toEqual([[1, 2, 3, 4]])
   })
 
+  test('a throwing listener costs no chunk, then push() rethrows', () => {
+    const parser = byteLengthParser({ length: 1 })
+    parser.once('data', () => {
+      throw new Error('listener failed')
+    })
+    const messages = collect(parser)
+    expect(() => parser.push(encode('ab'))).toThrow('listener failed')
+    expect(messages.map(decode)).toEqual(['a', 'b'])
+  })
+
   test('rejects lengths below one', () => {
     expect(errorCode(() => byteLengthParser({ length: 0 }))).toBe('INVALID_ARGUMENT')
     expect(errorCode(() => byteLengthParser({ length: 1.5 }))).toBe('INVALID_ARGUMENT')
@@ -141,6 +176,16 @@ describe('readlineParser', () => {
     parser.push(bytes.subarray(0, 3)) // splits the first character
     parser.push(bytes.subarray(3))
     expect(lines).toEqual(['', '안녕', ''])
+  })
+
+  test('a throwing listener costs no line and no other listener, then push() rethrows', () => {
+    const parser = readlineParser()
+    parser.once('data', () => {
+      throw new Error('listener failed')
+    })
+    const lines = collect(parser)
+    expect(() => parser.push(encode('one\ntwo\n'))).toThrow('listener failed')
+    expect(lines).toEqual(['one', 'two'])
   })
 
   test('removeListener detaches a listener', () => {

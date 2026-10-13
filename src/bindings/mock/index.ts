@@ -33,6 +33,8 @@ class DeviceState {
   stalled = false
   writeDelayMs = 0
   connected = true
+  /** Bumped by each reconnect(), so ports opened before it stay disconnected. */
+  plugs = 0
   openPort: MockBindingPort | null = null
   lines: Required<ModemLines> = { dtr: false, rts: false, brk: false }
   status: ModemStatus = { cts: false, dsr: false, dcd: false, ri: false }
@@ -142,6 +144,21 @@ export class MockDevice {
     this.#state.connected = false
     this.#state.notify()
   }
+
+  /**
+   * Plug back in after disconnect(): the device is listed and can be opened
+   * again. A port still open from before stays DISCONNECTED, like a real
+   * handle to a device that went away, and doesn't keep it busy.
+   */
+  reconnect(): void {
+    const state = this.#state
+    if (state.connected) return
+    state.connected = true
+    state.plugs++
+    state.openPort = null
+    state.inbound = new Uint8Array(0)
+    state.notify()
+  }
 }
 
 export class MockBinding implements Binding {
@@ -182,6 +199,7 @@ export class MockBinding implements Binding {
 class MockBindingPort implements BindingPort {
   #options: ResolvedOpenOptions
   readonly #state: DeviceState
+  readonly #plug: number
   #open = true
 
   constructor(
@@ -191,6 +209,7 @@ class MockBindingPort implements BindingPort {
   ) {
     this.#options = options
     this.#state = state
+    this.#plug = state.plugs
   }
 
   get options(): ResolvedOpenOptions {
@@ -278,7 +297,7 @@ class MockBindingPort implements BindingPort {
     if (!this.#open) {
       throw afterWait ? canceledError() : new SerialPortError('NOT_OPEN', `Port is not open: ${this.path}`)
     }
-    if (!this.#state.connected) {
+    if (!this.#state.connected || this.#plug !== this.#state.plugs) {
       throw new SerialPortError('DISCONNECTED', `Device disconnected: ${this.path}`)
     }
   }

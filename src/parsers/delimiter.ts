@@ -3,6 +3,7 @@
 
 import { EventEmitter } from 'node:events'
 import { invalidArgument, SerialPortError } from '../errors.js'
+import { emitEach, throwErrors } from '../internal/emit.js'
 import type { Parser, ParserEvents } from './types.js'
 
 export interface DelimiterParserOptions {
@@ -49,8 +50,11 @@ export class DelimiterParser extends EventEmitter<ParserEvents<Uint8Array>> impl
     // A delimiter could still begin in the last few bytes and finish in the next chunk.
     this.#searchFrom = Math.max(0, this.#length - delimiter.length + 1)
 
-    // Emit only once the buffer is consistent, so a throwing listener can't corrupt it.
-    for (const message of messages) this.emit('data', message)
+    // Emit only once the buffer is consistent, so a throwing listener can't
+    // corrupt it, and deliver every message before rethrowing what listeners threw.
+    const errors: unknown[] = []
+    for (const message of messages) errors.push(...emitEach(this, 'data', [message]))
+    throwErrors(errors)
   }
 
   /** Drop any buffered partial message. */

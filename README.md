@@ -59,23 +59,25 @@ for (const port of await list()) {
 
 ### `new SerialPort(options)`
 
-| Option           | Default  | |
-| ---------------- | -------- | - |
-| `path`           | required | Port to open. |
-| `baudRate`       | required | Any positive integer. Rates outside the classic table use `termios2` (Linux), `IOSSIOSPEED` (macOS) or the driver directly (Windows). |
-| `dataBits`       | `8`      | `5`, `6`, `7`, `8` |
-| `stopBits`       | `1`      | `1`, `2`; `1.5` on Windows (with 5 data bits) |
-| `parity`         | `'none'` | `'none'`, `'even'`, `'odd'`; `'mark'`, `'space'` on Linux and Windows. Bytes failing the check are dropped. |
-| `rtscts`         | `false`  | Hardware flow control. |
-| `xon` / `xoff`   | `false`  | Software flow control: honor / send XON/XOFF. |
-| `xany`           | `false`  | Any received byte restarts output (not on Windows). |
-| `hupcl`          | `true`   | Drop DTR/RTS on close. `false` keeps Arduino-style boards from resetting (see [Windows](#windows)). |
-| `lock`           | `true`   | Exclusive access. `false` allows sharing (not on Windows, where COM ports are always exclusive). |
-| `autoOpen`       | `true`   | Open on the next microtask. Methods called before then wait for it. |
-| `readBufferSize` | `65536`  | Bytes per read. |
-| `pollInterval`   | `1`      | How often to check the OS where it can't say when a port is ready, in ms: `drain()` on Windows, and fallbacks. Rarely worth changing. |
-| `writeTimeout`   | `1000`   | How long a write may stall — the OS taking no bytes when it should have room — before it rejects `TIMEOUT`. On macOS the clock starts once the output already handed over should be out (see [macOS](#macos)). `Infinity` waits forever. |
-| `binding`        | platform | Swap in another binding, e.g. `MockBinding` in tests. |
+| Option            | Default    | |
+| ----------------- | ---------- | - |
+| `path`            | required   | Port to open. |
+| `baudRate`        | required   | Any positive integer. Rates outside the classic table use `termios2` (Linux), `IOSSIOSPEED` (macOS) or the driver directly (Windows). |
+| `dataBits`        | `8`        | `5`, `6`, `7`, `8` |
+| `stopBits`        | `1`        | `1`, `2`; `1.5` on Windows (with 5 data bits) |
+| `parity`          | `'none'`   | `'none'`, `'even'`, `'odd'`; `'mark'`, `'space'` on Linux and Windows. Bytes failing the check are dropped. |
+| `rtscts`          | `false`    | Hardware flow control. |
+| `xon` / `xoff`    | `false`    | Software flow control: honor / send XON/XOFF. |
+| `xany`            | `false`    | Any received byte restarts output (not on Windows). |
+| `hupcl`           | `true`     | Drop DTR/RTS on close. `false` keeps Arduino-style boards from resetting (see [Windows](#windows)). |
+| `lock`            | `true`     | Exclusive access. `false` allows sharing (not on Windows, where COM ports are always exclusive). |
+| `autoOpen`        | `true`     | Open on the next microtask. Methods called before then wait for it. |
+| `readBufferSize`  | `65536`    | Bytes per read. |
+| `pollInterval`    | `1`        | How often to check the OS where it can't say when a port is ready, in ms: `drain()` on Windows, and fallbacks. Rarely worth changing. |
+| `writeTimeout`    | `1000`     | How long a write may stall — the OS taking no bytes when it should have room — before it rejects `TIMEOUT`. On macOS the clock starts once the output already handed over should be out (see [macOS](#macos)). `Infinity` waits forever. |
+| `maxQueuedWrites` | `Infinity` | Most `write()` calls pending at once, queued or in progress. Past it, `write()` rejects `QUEUE_FULL` at once instead of queueing behind output the device isn't taking, where each write would wait out `writeTimeout` in turn. |
+| `onListenerError` | —          | `(error, event) => void`: receives exceptions thrown by event listeners, piped parsers' included (see [Events](#events)). |
+| `binding`         | platform   | Swap in another binding, e.g. `MockBinding` in tests. |
 
 Invalid options throw `INVALID_ARGUMENT` from the constructor; valid options the
 platform can't honor throw `UNSUPPORTED`.
@@ -99,8 +101,9 @@ All return promises.
 - `flush()` — discards unread input and untransmitted output.
 - `pipe(parser)` / `unpipe(parser)` — feed incoming data to a parser.
 
-Properties: `path`, `baudRate`, `isOpen`. `await using port = new SerialPort(…)`
-closes the port when the scope ends.
+Properties: `path`, `baudRate`, `isOpen`, `queuedWrites` (`write()` calls not
+yet settled). `await using port = new SerialPort(…)` closes the port when the
+scope ends.
 
 ### Events
 
@@ -110,6 +113,13 @@ closes the port when the scope ends.
 | `data`  | `Uint8Array`               | |
 | `error` | `SerialPortError`          | A failed `autoOpen`, or a failed read — usually code `DISCONNECTED`, after which the port closes. |
 | `close` | `SerialPortError \| undefined` | Carries the error when a failed read caused the close; nothing after `close()`. |
+
+A listener that throws doesn't keep the others from running, and the port keeps
+reading. The exception goes to `onListenerError` if given, and otherwise
+surfaces as an uncaught exception. That includes the listeners of a piped
+parser: a parser delivers every message of a chunk, then rethrows what its
+listeners threw (an `AggregateError` if several did). An `error` event with no
+listener is uncaught either way, as with any `EventEmitter`.
 
 ### Errors
 
@@ -127,6 +137,7 @@ the raw `osCode` (errno or Win32 error) where one exists.
 | `DISCONNECTED`     | The device went away. |
 | `CANCELED`         | Interrupted by `close()`. |
 | `TIMEOUT`          | A write stalled for `writeTimeout` ms. |
+| `QUEUE_FULL`       | `write()` with `maxQueuedWrites` already pending. |
 | `IO`               | Any other OS failure. |
 
 ```ts
@@ -166,6 +177,7 @@ await port.write('AT\r\n')
 device.takeWritten()                // what the port wrote
 device.setStalled(true)             // the device stops taking output
 device.disconnect()                 // unplug
+device.reconnect()                  // plug back in; open() works again
 ```
 
 ## Platform notes
